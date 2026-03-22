@@ -10,6 +10,8 @@ Connect a LINE bot to your Claude Code with an MCP server.
 
 The MCP server receives LINE messages via webhook and provides tools to Claude to reply. When you message the bot, the server forwards the message to your Claude Code session.
 
+![Demo: LINE messages arriving in Claude Code](assets/demo.png)
+
 ### Prerequisites
 
 - [Bun](https://bun.sh) — the MCP server runs on Bun. Install with `curl -fsSL https://bun.sh/install | bash`.
@@ -264,6 +266,8 @@ ask you to paste or summarize.
 透過 MCP server 將 LINE bot 連接到你的 Claude Code。
 
 MCP server 透過 webhook 接收 LINE 訊息，並提供工具讓 Claude 回覆。當你傳送訊息給 bot 時，server 會將訊息轉發到你的 Claude Code session。
+
+![示範：LINE 訊息出現在 Claude Code 中](assets/demo.png)
 
 ### 前置需求
 
