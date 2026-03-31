@@ -86,18 +86,39 @@ Replace `/path/to/line-plugin` with the actual clone path, then restart Claude C
 
 ---
 
-## Life-OS Extensions
+## Life-OS Extensions (Optional)
 
-Two files are auto-read on every incoming message — no extra setup once they exist:
+These features require a [Life-OS](https://github.com/walkpod1007/life-os) setup. Skip this section if you're using the plugin standalone.
 
-| File | Purpose |
-| --- | --- |
-| `~/.claude/STATE.md` | Human status + AI observations, updated nightly by Gemini |
-| `~/.claude/flag.md` | Boost keywords LRU ring buffer (80 entries, 6 channels) |
+### STATE.md (requires Life-OS daily log system)
 
-**Morning brief**: The `morning-brief` skill must be defined at `~/Documents/Life-OS/skills/morning-brief/SKILL.md`. Today's brief status is tracked in `~/.claude/channels/line/.morning_brief_date` to avoid double-firing.
+Auto-read on every incoming message. Contains human status + AI observations, updated nightly by Gemini.
 
-**Token footer** format appended to every reply:
+**File**: `~/.claude/STATE.md`
+
+If this file doesn't exist, the plugin works fine — context injection is skipped gracefully.
+
+### flag.md (requires Life-OS daily log system)
+
+Auto-read on every incoming message. Maintains a boost keywords LRU ring buffer (80 entries, 6 channels) for semantic deduplication.
+
+**File**: `~/.claude/flag.md`
+
+If this file doesn't exist, the plugin works fine — keyword tracking is disabled.
+
+### Morning brief trigger
+
+The plugin automatically fires the `morning-brief` skill on the first message after 07:00 Asia/Taipei, if the skill is defined at:
+
+```
+~/Documents/Life-OS/skills/morning-brief/SKILL.md
+```
+
+Today's brief status is tracked in `~/.claude/channels/line/.morning_brief_date` to avoid double-firing. If the skill doesn't exist or the path is missing, this trigger is skipped gracefully.
+
+### Token footer
+
+Format appended to every reply (showing token usage breakdown):
 
 ```
 ─
