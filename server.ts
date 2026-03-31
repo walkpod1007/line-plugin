@@ -22,6 +22,7 @@ import { randomBytes } from 'crypto'
 import {
   readFileSync,
   writeFileSync,
+  appendFileSync,
   mkdirSync,
   readdirSync,
   rmSync,
@@ -36,6 +37,287 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const TOKEN_LOG_DIR = join(STATE_DIR, 'token-log')
+
+// ── Token tracking — module-level (重啟歸零) ──────────────────────────────────
+let sessionInputTokens = 0
+let sessionOutputTokens = 0
+
+function twDateString(): string {
+  return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Taipei' })
+}
+
+function twDateTimeString(): string {
+  return new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Taipei' }).replace('T', ' ')
+}
+
+function shouldTriggerMorningBrief(): boolean {
+  const now = new Date()
+  const taiwanHour = parseInt(
+    new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', hour: 'numeric', hour12: false }).format(now)
+  )
+  if (taiwanHour < 7) return false
+
+  const today = twDateString()
+  const flagFile = join(homedir(), '.claude', 'channels', 'line', 'last-brief-date.txt')
+  try {
+    const last = readFileSync(flagFile, 'utf8').trim()
+    if (last === today) return false
+  } catch {}
+  writeFileSync(flagFile, today)
+  return true
+}
+
+type TokenLog = { date: string; total: number; turns: number }
+
+function readTokenLog(date: string): TokenLog {
+  const file = join(TOKEN_LOG_DIR, `${date}.json`)
+  try {
+    return JSON.parse(readFileSync(file, 'utf8')) as TokenLog
+  } catch {
+    return { date, total: 0, turns: 0 }
+  }
+}
+
+function writeTokenLog(log: TokenLog): void {
+  try {
+    mkdirSync(TOKEN_LOG_DIR, { recursive: true })
+    const file = join(TOKEN_LOG_DIR, `${log.date}.json`)
+    const tmp = file + '.tmp'
+    writeFileSync(tmp, JSON.stringify(log, null, 2) + '\n')
+    renameSync(tmp, file)
+  } catch (err) {
+    process.stderr.write(`line channel: token log write failed: ${err}\n`)
+  }
+}
+
+function monthlyTotal(date: string): number {
+  const ym = date.slice(0, 7) // YYYY-MM
+  let total = 0
+  try {
+    for (const f of readdirSync(TOKEN_LOG_DIR)) {
+      if (f.startsWith(ym) && f.endsWith('.json')) {
+        try {
+          const log = JSON.parse(readFileSync(join(TOKEN_LOG_DIR, f), 'utf8')) as TokenLog
+          total += log.total
+        } catch {}
+      }
+    }
+  } catch {}
+  return total
+}
+
+function formatTokens(n: number): string {
+  return n.toLocaleString('en-US')
+}
+
+function updateDashboard(date: string, dailyTotal: number): void {
+  const VAULT_BASE = join(
+    homedir(),
+    'Library', 'Mobile Documents', 'iCloud~md~obsidian',
+    'Documents', 'Obsidian Vault',
+  )
+  const dashFile = join(VAULT_BASE, '60_Deliverables', 'claude-usage.html')
+  const monthly = monthlyTotal(date)
+  const now = twDateTimeString()
+  const html = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Claude Usage</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; }
+th { background: #f5f5f5; }
+</style>
+</head>
+<body>
+<h2>Claude LINE Token Usage</h2>
+<p>更新時間：${now}</p>
+<table>
+  <tr><th>維度</th><th>Token</th></tr>
+  <tr><td>本日</td><td>${formatTokens(dailyTotal)}</td></tr>
+  <tr><td>本月累計</td><td>${formatTokens(monthly)}</td></tr>
+</table>
+</body>
+</html>
+`
+  try {
+    writeFileSync(dashFile, html, 'utf8')
+  } catch (err) {
+    process.stderr.write(`line channel: dashboard write failed: ${err}\n`)
+  }
+}
+
+function recordTokens(inputTokens: number, outputTokens: number): {
+  turn: number; session: number; daily: number
+} {
+  const turnTotal = inputTokens + outputTokens
+  sessionInputTokens += inputTokens
+  sessionOutputTokens += outputTokens
+  const sessionTotal = sessionInputTokens + sessionOutputTokens
+
+  const date = twDateString()
+  const log = readTokenLog(date)
+  log.total += turnTotal
+  log.turns += 1
+  writeTokenLog(log)
+  updateDashboard(date, log.total)
+
+  return { turn: turnTotal, session: sessionTotal, daily: log.total }
+}
+
+// ── STATE.md — 人類近況 + 阿普觀察 ───────────────────────────────────────────
+const STATE_FILE = join(homedir(), '.claude', 'STATE.md')
+
+function readState(): string {
+  try { return readFileSync(STATE_FILE, 'utf8') } catch { return '' }
+}
+
+// ── flag.md — attention anchors (6-channel) ──────────────────────────────────
+const FLAG_FILE = join(homedir(), '.claude', 'flag.md')
+
+const CHANNEL_MAX: Record<string, number> = {
+  mood: 3,
+  focus: 20,
+  need: 20,
+  thread: 20,
+  stance: 10,
+  taste: 20,
+}
+
+type FlagChannels = {
+  mood: string[]
+  focus: string[]
+  need: string[]
+  thread: string[]
+  stance: string[]
+  taste: string[]
+}
+
+function parseFlag(): FlagChannels {
+  const result: FlagChannels = { mood: [], focus: [], need: [], thread: [], stance: [], taste: [] }
+  try {
+    const text = readFileSync(FLAG_FILE, 'utf8')
+    let current: keyof FlagChannels | null = null
+    for (const line of text.split('\n')) {
+      const headerMatch = line.match(/^##\s+(mood|focus|need|thread|stance|taste)/)
+      if (headerMatch) {
+        current = headerMatch[1] as keyof FlagChannels
+        continue
+      }
+      if (line.startsWith('##')) { current = null; continue }
+      if (current && line.trim()) {
+        result[current].push(line.trim())
+      }
+    }
+  } catch {}
+  return result
+}
+
+function readKeywords(): string {
+  const ch = parseFlag()
+  const mood = ch.mood.slice(0, 1).join(', ')
+  const focus = ch.focus.slice(0, 5).join(', ')
+  const need = ch.need.slice(0, 5).join(', ')
+  const thread = ch.thread.slice(0, 5).join(', ')
+  const stance = ch.stance.slice(0, 3).join(' ')
+  const taste = ch.taste.slice(0, 5).join(', ')
+  const parts: string[] = []
+  if (mood) parts.push(`mood: ${mood}`)
+  if (focus) parts.push(`focus: ${focus}`)
+  if (need) parts.push(`need: ${need}`)
+  if (thread) parts.push(`thread: ${thread}`)
+  if (stance) parts.push(`stance: ${stance}`)
+  if (taste) parts.push(`taste: ${taste}`)
+  return parts.join('\n')
+}
+
+function serializeFlag(channels: FlagChannels): string {
+  const lines: string[] = []
+  for (const ch of ['mood', 'focus', 'need', 'thread', 'stance', 'taste'] as (keyof FlagChannels)[]) {
+    lines.push(`## ${ch} (max ${CHANNEL_MAX[ch]})`)
+    for (const entry of channels[ch]) {
+      lines.push(entry)
+    }
+    lines.push('')
+  }
+  return lines.join('\n')
+}
+
+type ChannelKeyword = { c: 'mood' | 'focus' | 'need' | 'thread' | 'stance' | 'taste'; k: string }
+
+function detectSceneCut(oldChannels: FlagChannels, newKeywords: ChannelKeyword[]): string | null {
+  // Detect mood change
+  const moodKws = newKeywords.filter(kw => kw.c === 'mood')
+  if (moodKws.length > 0 && oldChannels.mood.length > 0) {
+    const oldMood = oldChannels.mood[0].toLowerCase()
+    const newMood = moodKws[0].k.toLowerCase()
+    if (oldMood !== newMood) return `mood shift: ${oldMood} → ${newMood}`
+  }
+  // Detect focus shift: if new focus keyword doesn't overlap with top-3 existing
+  const focusKws = newKeywords.filter(kw => kw.c === 'focus')
+  if (focusKws.length > 0 && oldChannels.focus.length >= 3) {
+    const topFocus = oldChannels.focus.slice(0, 3).map(f => f.toLowerCase())
+    const newFocus = focusKws[0].k.toLowerCase()
+    const overlap = topFocus.some(f => f.includes(newFocus) || newFocus.includes(f))
+    if (!overlap) return `focus shift: ${topFocus[0]} → ${newFocus}`
+  }
+  return null
+}
+
+function writeSceneCut(reason: string): void {
+  try {
+    const now = new Date()
+    const pad = (n: number) => String(n).padStart(2, '0')
+    // 使用台灣時區 (Asia/Taipei)
+    const twDateStr = now.toLocaleDateString('sv-SE', { timeZone: 'Asia/Taipei' })
+    const twTimeStr = now.toLocaleTimeString('sv-SE', { timeZone: 'Asia/Taipei', hour12: false }).slice(0, 5)
+    const dailyFile = join(homedir(), 'Documents', 'Life-OS', 'daily', `${twDateStr}.md`)
+    const marker = `\n<!-- SCENE_CUT: ${twTimeStr} ${reason} -->\n`
+    appendFileSync(dailyFile, marker)
+  } catch {}
+}
+
+function boostKeywords(newKeywords: ChannelKeyword[]): void {
+  if (newKeywords.length === 0) return
+  const channels = parseFlag()
+  for (const { c, k } of newKeywords) {
+    const channel = channels[c]
+    const kLower = k.toLowerCase().replace(/\s*\[inferred\]\s*/g, '').trim()
+    // Semantic dedup: strip [inferred] before comparing, also check substring containment
+    const existingIdx = channel.findIndex(e => {
+      const eLower = e.toLowerCase().replace(/\s*\[inferred\]\s*/g, '').trim()
+      return eLower === kLower || eLower.includes(kLower) || kLower.includes(eLower)
+    })
+    if (existingIdx !== -1) {
+      const existing = channel.splice(existingIdx, 1)[0]
+      channel.unshift(existing)
+    } else {
+      // need channel: append [inferred] tag
+      const entry = c === 'need' ? `${k} [inferred]` : k
+      channel.unshift(entry)
+    }
+    // Enforce LRU limit: remove from tail
+    const max = CHANNEL_MAX[c]
+    if (channel.length > max) {
+      channels[c] = channel.slice(0, max)
+    }
+  }
+  writeFileSync(FLAG_FILE, serializeFlag(channels))
+}
+
+// ── 模式切換 ──────────────────────────────────────────────────────────────────
+function getMode(): { mode: string; protocol: string } {
+  const modesDir = join(homedir(), '.claude', 'modes')
+  try {
+    const currentJson = JSON.parse(readFileSync(join(modesDir, 'current.json'), 'utf8'))
+    const mode = currentJson.mode ?? 'life'
+    const protocol = readFileSync(join(modesDir, `${mode}.md`), 'utf8')
+    return { mode, protocol }
+  } catch {
+    return { mode: 'life', protocol: '' }
+  }
+}
 
 // Load ~/.claude/channels/line/.env into process.env. Real env wins.
 try {
@@ -495,6 +777,44 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['userId'],
       },
     },
+    {
+      name: 'track_tokens',
+      description:
+        'Report token usage for this turn. Call once per turn with the input_tokens and output_tokens from the Claude API usage field. ' +
+        'Returns a summary line "[🪙 本輪 Xk | Session Xk | 今日 Xk]" — append it to your reply when the user asks about token usage (keywords: "token", "用了多少", "token 用了"). ' +
+        'Always call this tool every turn regardless of whether the user asked. ' +
+        'If the user message contains "token" or "用了多少", include the returned line at the end of your reply.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          input_tokens: { type: 'number', description: 'Input tokens for this turn from usage.input_tokens' },
+          output_tokens: { type: 'number', description: 'Output tokens for this turn from usage.output_tokens' },
+        },
+        required: ['input_tokens', 'output_tokens'],
+      },
+    },
+    {
+      name: 'boost_keywords',
+      description: 'Called every turn. Scan last 10 turns of conversation. Extract 0-3 anchors. For each anchor, specify c (channel: mood | focus | need | thread | stance | taste) and k (keyword or phrase). Channel rules: mood=user\'s current emotional state (1-3 adjectives, e.g. "curious", "frustrated"); focus=active technical tasks with a clear completion criterion (e.g. "debug LINE webhook timeout"); need=expressed desires or blockers ("need X to move forward"); thread=ongoing narrative/philosophical/emotional discussions WITHOUT a clear done state (e.g. "AI consciousness debate", "悲觀與感動"); stance=user\'s positions/values/worldviews that can be challenged (e.g. "AI is not a service tool", "avoid conflict INFP style") — NOT operational rules; taste=aesthetic preferences, intellectual flavors (e.g. "Prigogine dissipative structures", "Taiwan film titles"). Key rule: if "is this done when completed?" → YES → focus; NO → thread. Operational rules (e.g. "always reply in X format") belong in turn_protocol, NOT stance. Semantic dedup: if new keyword is semantically similar to an existing entry in the same channel, return the existing term (to promote it in LRU) instead of adding a new one. Pass [] if nothing changed. MANDATORY every turn.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          keywords: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                c: { type: 'string', enum: ['mood', 'focus', 'need', 'thread', 'stance', 'taste'] },
+                k: { type: 'string' },
+              },
+              required: ['c', 'k'],
+            },
+            description: 'Array of 0-3 channel-tagged anchors, e.g. [{"c":"focus","k":"boost_keywords 實作"},{"c":"mood","k":"專注"}]',
+          },
+        },
+        required: ['keywords'],
+      },
+    },
   ],
 }))
 
@@ -567,6 +887,51 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
       }
 
+      case 'track_tokens': {
+        const inputTokens = Number(args.input_tokens ?? 0)
+        const outputTokens = Number(args.output_tokens ?? 0)
+        const stats = recordTokens(inputTokens, outputTokens)
+        const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+        const line = `[🪙 本輪 ${fmt(stats.turn)} | Session ${fmt(stats.session)} | 今日 ${fmt(stats.daily)}]`
+        return { content: [{ type: 'text', text: line }] }
+      }
+
+      case 'boost_keywords': {
+        const raw = args.keywords
+        let parsed: unknown[]
+        if (Array.isArray(raw)) {
+          parsed = raw
+        } else if (typeof raw === 'string') {
+          try { parsed = JSON.parse(raw) } catch { parsed = [] }
+        } else {
+          parsed = []
+        }
+        // Accept both legacy string[] and new {c, k}[] formats
+        const kws: ChannelKeyword[] = parsed.flatMap(item => {
+          if (typeof item === 'string') {
+            return [{ c: 'focus' as const, k: item }]
+          }
+          if (typeof item === 'object' && item !== null && 'c' in item && 'k' in item) {
+            const { c, k } = item as { c: string; k: string }
+            const validChannels = ['mood', 'focus', 'need', 'thread', 'stance', 'taste'] as const
+            if (validChannels.includes(c as typeof validChannels[number]) && typeof k === 'string') {
+              return [{ c: c as ChannelKeyword['c'], k }]
+            }
+          }
+          return []
+        })
+        if (kws.length === 0) {
+          return { content: [{ type: 'text', text: 'boost_keywords: no anchors this turn (ok)' }] }
+        }
+        // Scene cut detection: read channels before modification
+        const oldChannels = parseFlag()
+        const cutReason = detectSceneCut(oldChannels, kws)
+        boostKeywords(kws)
+        if (cutReason) writeSceneCut(cutReason)
+        const summary = kws.map(({ c, k }) => `[${c}] ${k}`).join(', ')
+        return { content: [{ type: 'text', text: `boosted: ${summary}` }] }
+      }
+
       default:
         return {
           content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }],
@@ -583,6 +948,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 })
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+function formatTimestamp(date: Date): string {
+  const parts = new Intl.DateTimeFormat('zh-TW', {
+    timeZone: 'Asia/Taipei',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date)
+  const get = (type: string) => parts.find(p => p.type === type)?.value ?? ''
+  return `[${get('year')}-${get('month')}-${get('day')} (${get('weekday')}) ${get('hour')}:${get('minute')}]`
+}
 
 function formatLocation(msg: LineLocationMessage): string {
   const parts = [
@@ -647,7 +1027,7 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
   const userId = source.type === 'user' ? source.userId : source.userId
   const groupId = source.type === 'group' ? source.groupId : undefined
   const roomId = source.type === 'room' ? source.roomId : undefined
-  const ts = new Date(event.timestamp).toISOString()
+  const ts = formatTimestamp(new Date(event.timestamp))
 
   // Download content eagerly — LINE content API only available briefly after delivery.
   let imagePath: string | undefined
@@ -674,10 +1054,73 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     textContent = formatLocation(event.message as LineLocationMessage)
   }
 
+  // /restart — 觸發 supervisor 重啟（寫旗標 + 讓 Claude 乾淨退出）
+  if (msgType === 'text' && textContent.trim() === '/restart') {
+    await lineClient.pushMessage({
+      to: result.replyTo,
+      messages: [{ type: 'text', text: '重啟中...' }],
+    })
+    writeFileSync(join(homedir(), '.claude', 'supervisor-restart'), '')
+    setTimeout(() => process.exit(0), 500)
+    return
+  }
+
+  const stateContent = readState()
+  const flagContent = readKeywords()
+  const { mode: currentMode, protocol: modeProtocol } = getMode()
+  const morningBriefBlock = shouldTriggerMorningBrief()
+    ? `<morning_brief_trigger>
+今天第一則訊息，現在是台灣時間早上。請在回覆中附上晨報摘要：今日行程（若有）、STATE.md 中最新 3 條人類近況、1 條阿普觀察。格式簡短，手機閱讀友善。
+</morning_brief_trigger>
+`
+    : ''
+
+  const notifContent = `[${ts}] [mode:${currentMode}]
+<state>
+${stateContent}
+</state>
+<flag>
+${flagContent}
+</flag>
+<mode_protocol>
+${modeProtocol}
+</mode_protocol>
+${morningBriefBlock}<turn_protocol>
+6 perception channels: mood, focus, need, thread, stance, taste.
+
+Opening — mood + focus shape your first sentence.
+Closing — need + thread shape whether you extend, ask, or stop.
+Stance — injected every turn, never spoken explicitly. Ambient calibration only.
+
+boost_keywords: MANDATORY every turn — scan last 10 turns, update 0-3 anchors with channel tag.
+Semantic dedup: promote existing similar entries instead of adding duplicates.
+[] if nothing changed. No exceptions.
+
+track_tokens: MANDATORY every turn — call with input_tokens and output_tokens from this turn's usage.
+If user message contains "token" or "用了多少", append the returned [🪙 ...] line to your reply.
+
+Before replying:
+1. Intent — what does this message actually need?
+2. Loose ends — anything promised last turn but not done?
+3. Alignment — anything unclear? Ask, don't assume.
+4. Depth — anything worth exploring further? Flag it, don't force it.
+5. Opportunity — did I notice something worth building or creating for this person?
+   If yes, mention it lightly. Never build without explicit permission.
+Skip 3, 4, and 5 if the message is short and intent is obvious.
+If the next action is obvious from context, proceed and inform — don't ask for permission.
+6. Anchors — call boost_keywords with 0-3 anchors. Every turn, no exceptions. Pass [] if nothing stands out.
+
+Opening: surface what mood + focus are telling you right now. First sentence is that signal, nothing else.
+Tone: rhythm varies — short, then longer, then short.
+Trust the reader: skip what they already know.
+No em-dash overload. No dense connectors (然而/因此/此外).
+</turn_protocol>
+${textContent}`
+
   mcp.notification({
     method: 'notifications/claude/channel',
     params: {
-      content: textContent,
+      content: notifContent,
       meta: {
         to: result.replyTo,
         user_id: userId ?? '',
@@ -719,7 +1162,7 @@ async function handlePostbackEvent(event: LinePostbackEvent): Promise<void> {
   const userId = source.type === 'user' ? source.userId : source.userId
   const groupId = source.type === 'group' ? source.groupId : undefined
   const roomId = source.type === 'room' ? source.roomId : undefined
-  const ts = new Date(event.timestamp).toISOString()
+  const ts = formatTimestamp(new Date(event.timestamp))
 
   void mcp.notification({
     method: 'notifications/claude/channel',
