@@ -1,88 +1,117 @@
 # line-plugin
 
-LINE MCP server for Claude Code, extended for Life-OS.
-
-Based on [breakingmind/claude-external-plugins-line](https://github.com/breakingmind/claude-external-plugins-line). The original project provides the core LINE webhook → MCP bridge. This fork adds Life-OS–specific context injection and automation layers on top.
+> LINE Messaging API MCP server for Claude Code, with Life-OS extensions.
+> Inspired by [breakingmind/claude-external-plugins-line](https://github.com/breakingmind/claude-external-plugins-line).
 
 ---
 
-## Extensions (Life-OS specific)
-
-The following features are added beyond the original project:
+## Features
 
 | Extension | Description |
 | --- | --- |
-| **STATE.md / flag.md injection** | On each inbound message, `~/.claude/STATE.md` (人類近況 + 阿普觀察) and `~/.claude/flag.md` (6-channel boost keywords, LRU 80 entries) are read and prepended to the Claude context. |
-| **boost_keywords tool** | Semantic deduplication + LRU eviction on the keywords ring buffer. Writes back to `flag.md` after each turn. |
-| **turn_protocol** | Reply format rules enforced per turn: length cap, no filler praise, direct answers first. |
-| **scene-cut detection** | Detects topic shifts mid-conversation and appends a timestamped entry to `~/.claude/projects/.../daily/YYYY-MM-DD.md`. |
-| **Taiwan timezone timestamps** | All log entries and session markers use `Asia/Taipei` (UTC+8). |
-| **Morning brief trigger** | First inbound message after 07:00 Asia/Taipei triggers the `morning-brief` skill automatically. |
-| **Token tracking** | Each reply footer includes: tokens used this turn / session total / today's total. |
-| **/restart command** | User sends `/restart` in LINE → Claude Code process is restarted via `claude-supervisor.sh`. |
-| **Zhihu extraction via Chrome cookies** | Fetches Zhihu article content by decrypting Chrome's local cookie store, bypassing login walls. |
+| **STATE.md / flag.md injection** | Each inbound message prepends `~/.claude/STATE.md` (人類近況 + 阿普觀察) and `~/.claude/flag.md` (boost keywords, LRU 80 entries) into Claude context |
+| **boost_keywords tool** | Semantic deduplication + LRU eviction on the keywords ring buffer; writes back to `flag.md` after each turn |
+| **turn_protocol** | Enforces reply format per turn: length cap, no filler praise, direct answer first |
+| **scene-cut detection** | Detects topic shifts mid-conversation and appends a timestamped entry to the daily log file |
+| **Taiwan timezone timestamps** | All log entries and session markers use `Asia/Taipei` (UTC+8) |
+| **Morning brief trigger** | First message after 07:00 Asia/Taipei automatically fires the `morning-brief` skill |
+| **Token tracking** | Each reply footer shows: tokens this turn / session total / today's total |
+| **/restart command** | Send `/restart` in LINE → restarts the Claude Code process via `claude-supervisor.sh` |
+| **Zhihu extraction via Chrome cookies** | Decrypts Chrome's local cookie store to fetch Zhihu articles without manual login |
 
 ---
 
-## Setup
+## Prerequisites
 
-For LINE bot creation, webhook configuration, plugin installation, credential storage, pairing, and access control, see the [original project README](https://github.com/breakingmind/claude-external-plugins-line).
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed
+- [Bun](https://bun.sh) runtime (`brew install bun`)
+- LINE Messaging API account (free tier works)
+- A publicly reachable HTTPS endpoint — [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) is the recommended zero-config option
 
 ---
 
-## Life-OS specific configuration
+## Quick Start
 
-### Context injection files
+### 1. Create LINE Bot
+
+1. Go to [LINE Developers Console](https://developers.line.biz/) and create a new provider + Messaging API channel.
+2. Under **Messaging API** tab: note the **Channel Access Token** (issue one if needed) and **Channel Secret**.
+3. Disable auto-reply messages (Messaging API → Auto-reply messages → Disabled) so Claude handles all replies.
+
+### 2. Install
+
+```bash
+git clone https://github.com/walkpod1007/line-plugin.git
+cd line-plugin
+bun install
+```
+
+### 3. Configure
+
+```bash
+mkdir -p ~/.claude/channels/line
+cat > ~/.claude/channels/line/.env << 'EOF'
+LINE_CHANNEL_ACCESS_TOKEN=your_token
+LINE_CHANNEL_SECRET=your_secret
+LINE_WEBHOOK_PORT=3000
+EOF
+```
+
+### 4. Set Webhook URL
+
+Start a Cloudflare Tunnel pointing at the local port:
+
+```bash
+cloudflared tunnel --url http://localhost:3000
+```
+
+Copy the generated `https://*.trycloudflare.com` URL and paste it into LINE Developers Console → **Webhook URL** (append `/webhook`), then click **Verify**.
+
+### 5. Connect to Claude Code
+
+Add the following to your `.mcp.json` (or `~/.claude/mcp.json` for global scope):
+
+```json
+{
+  "mcpServers": {
+    "line-plugin": {
+      "command": "/opt/homebrew/bin/bun",
+      "args": ["/path/to/line-plugin/server.ts"]
+    }
+  }
+}
+```
+
+Replace `/path/to/line-plugin` with the actual clone path, then restart Claude Code.
+
+---
+
+## Life-OS Extensions
+
+Two files are auto-read on every incoming message — no extra setup once they exist:
 
 | File | Purpose |
 | --- | --- |
 | `~/.claude/STATE.md` | Human status + AI observations, updated nightly by Gemini |
 | `~/.claude/flag.md` | Boost keywords LRU ring buffer (80 entries, 6 channels) |
 
-Both files are auto-read on each incoming message. No extra setup needed once they exist.
+**Morning brief**: The `morning-brief` skill must be defined at `~/Documents/Life-OS/skills/morning-brief/SKILL.md`. Today's brief status is tracked in `~/.claude/channels/line/.morning_brief_date` to avoid double-firing.
 
-### Morning brief
-
-The `morning-brief` skill must be defined under `~/Documents/Life-OS/skills/morning-brief/SKILL.md`. The LINE plugin checks the current hour on message receipt and fires the skill if the hour >= 7 and no brief has been sent today (tracked in `~/.claude/channels/line/.morning_brief_date`).
-
-### Token tracking
-
-Token counts are pulled from Claude Code's internal session state and appended as a footer:
+**Token footer** format appended to every reply:
 
 ```
 ─
 tokens: 1,234 this turn | 45,678 session | 123,456 today
 ```
 
-### /restart command
+---
 
-When the LINE message body equals `/restart` exactly:
-1. The plugin replies "重啟中..." via LINE.
-2. It calls `bash ~/Documents/Life-OS/scripts/claude-supervisor.sh restart`.
-3. The new Claude process inherits the same channel config.
+## Commands
 
-### Zhihu extraction
-
-Used by the `capture` skill when a `zhihu.com` URL is detected. The plugin locates Chrome's `Cookies` SQLite file, decrypts the `z_c0` cookie using the macOS Keychain master key, and injects it into the fetch request. No credentials are stored separately.
+`/restart` — Replies "重啟中..." then calls `bash ~/Documents/Life-OS/scripts/claude-supervisor.sh restart` to reboot the Claude Code process.
 
 ---
 
-## 繁體中文說明
+## Credits
 
-### 擴充功能總覽
-
-本 fork 基於 [breakingmind/claude-external-plugins-line](https://github.com/breakingmind/claude-external-plugins-line) 原專案，在核心 LINE webhook → MCP 橋接基礎上，加入以下 Life-OS 專屬功能：
-
-- **STATE.md / flag.md 注入**：每則收到的訊息，自動將人類近況與關鍵字清單注入 Claude 上下文。
-- **boost_keywords 工具**：語意去重 + LRU 淘汰機制，維護 80 條關鍵字緩衝。
-- **turn_protocol 回覆規範**：每輪強制執行回覆格式規則（長度上限、禁止填充讚美、直接回應）。
-- **scene-cut 偵測**：偵測話題切換，寫入當日對話日誌。
-- **台灣時區時間戳記**：所有記錄使用 Asia/Taipei（UTC+8）。
-- **晨報觸發**：07:00 後第一則訊息自動觸發 `morning-brief` 技能。
-- **token 追蹤**：每則回覆顯示本輪 / Session / 今日 token 用量。
-- **/restart 指令**：LINE 傳送 `/restart` → 透過 `claude-supervisor.sh` 重啟 Claude Code。
-- **知乎擷取（Chrome cookie 解密）**：自動解密 Chrome 本地 cookie 存取知乎內容，無需手動登入。
-
-### 基本設定
-
-LINE Bot 建立、webhook 設定、外掛安裝、憑證儲存、配對與存取控制，請參考[原專案 README](https://github.com/breakingmind/claude-external-plugins-line)。
+Based on [breakingmind/claude-external-plugins-line](https://github.com/breakingmind/claude-external-plugins-line), which provides the core LINE webhook → MCP bridge. This fork adds Life-OS–specific context injection, automation layers, and the extensions listed above.
